@@ -1,13 +1,3 @@
-"""
-Feature selection utilities: IV/WOE, correlation, VIF, and simple distribution diagnostics.
-
-Key design goals:
-- Safer math (smoothing to avoid divide-by-zero / inf)
-- Robust handling of missing values
-- Clearer return values + consistent naming
-- Optional plotting dependencies (Plotly / seaborn)
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,6 +10,7 @@ import pandas as pd
 
 import matplotlib.pyplot as plt
 
+
 try:
     import seaborn as sns  # optional, used in good_bad_distribution
 except Exception:  # pragma: no cover
@@ -27,13 +18,12 @@ except Exception:  # pragma: no cover
 
 try:
     import plotly.graph_objects as go  # optional, used in plot_information_value
-    import plotly.express as px        # optional, used in funnel + heatmap
+    import plotly.express as px        # optional, used in funnel + heatmap + worst-tail plots
 except Exception:  # pragma: no cover
     go = None  # type: ignore
     px = None  # type: ignore
 
 from statsmodels.stats.outliers_influence import variance_inflation_factor
-
 
 # -------------------------
 # Helpers / small utilities
@@ -216,7 +206,9 @@ def information_value_calculation_dictionary(
     Same as `information_value_calculation`, with optional enrichment using a data dictionary.
 
     Expected data_dictionary columns (if provided):
-    - Variable, Definition, Valid Min, Valid Max, Direction
+    - Variable, Definition, Val    enriched["cleaned_var"] = enriched["Variable"].astype(str).apply(
+        lambda x: x.split("_")[-1] if "_" in x else x
+    )d Min, Valid Max, Direction
     """
     iv_df = information_value_calculation(data, bad_flag, num_list, cat_list, bins=bins)
 
@@ -319,6 +311,375 @@ def iv_survived(
 
     return survived_iv_set, num_iv_survived, cat_iv_survived, total_iv_survived
 
+
+# =============================================
+#       worst tail analysis
+# =============================================
+def rank_features_by_worst_tail_bad_vol(
+    data: pd.DataFrame,
+    bad_flag: str,
+    num_list: list,
+    data_dictionary: pd.DataFrame = None,
+    worst_pct: float = 0.05,          # e.g. 0.05 for worst 5%
+    min_non_missing: int = 200,
+    missing_sentinels: tuple = (-9999,),
+    direction_default: int = 0,       # 0 => infer if missing
+) -> pd.DataFrame:
+    """
+    Rank numerical features by BAD VOLUME captured in the worst X% tail.
+    """
+
+    if not (0 < worst_pct < 1):
+        raise ValueError("worst_pct must be between 0 and 1 (e.g., 0.05 for 5%).")
+
+    df = data.copy()
+
+    # --- target cleaning ---
+    y = pd.to_numeric(df[bad_flag], errors="coerce")
+    df = df.loc[y.isin([0, 1])].copy()
+    df[bad_flag] = y.loc[df.index].astype(int)
+
+    overall_bad_rate = df[bad_flag].mean()
+    if pd.isna(overall_bad_rate):
+        raise ValueError("Overall bad rate is NaN (bad_flag might be empty after cleaning).")
+
+    # --- normalise data_dictionary columns (case-insensitive) ---
+    dd = None
+    if data_dictionary is not None:
+        dd = data_dictionary.copy()
+        dd.columns = [c.strip().lower() for c in dd.columns]
+
+        # accept both "variable"/"definition"/"direction" in any case
+        required = {"variable", "definition", "direction"}
+        if not required.issubset(set(dd.columns)):
+            raise ValueError(f"data_dictionary must include columns: {required} (case-insensitive). Got: {set(dd.columns)}")
+
+        dd["variable"] = dd["variable"].astype(str).str.strip()
+
+        # quick lookup table by variable
+        dd_lookup = dd.set_index("variable", drop=False)
+
+    def clean_variable_name(target_variable: str) -> str:
+        s = str(target_variable)
+        cleaned = s.split("_")[-1] if "_" in s else s
+        cleaned = cleaned.rstrip(" -") if " -" in cleaned else cleaned
+        return cleaned
+
+    results = []
+
+    for col in num_list:
+        if col not in df.columns:
+            continue
+
+        s_raw = pd.to_numeric(df[col], errors="coerce")
+
+        # treat sentinels as missing
+        for ms in missing_sentinels:
+            s_raw = s_raw.mask(s_raw == ms)
+
+        mask = s_raw.notna()
+        n_non_missing = int(mask.sum())
+        if n_non_missing < min_non_missing:
+            continue
+
+        x = s_raw.loc[mask]
+        y_sub = df.loc[mask, bad_flag]
+
+        cleaned_name = clean_variable_name(col)
+
+        # --- get direction & definition from dictionary if possible ---
+        definition = None
+        direction = direction_default
+
+        if dd is not None and cleaned_name in dd_lookup.index:
+            row = dd_lookup.loc[cleaned_name]
+            definition = row.get("definition", None)
+            d = row.get("direction", np.nan)
+            if pd.notnull(d):
+                try:
+                    direction = int(float(d))
+                except Exception:
+                    direction = direction_default
+
+        # direction meaning:
+        #  1 => high values are worse (worst tail = top X%)
+        # -1 => low values are worse (worst tail = bottom X%)
+        #  0/unknown => infer via Spearman correlation with target
+        inferred_corr = np.nan
+        direction_used = direction
+
+        if direction_used == 0:
+            inferred_corr = x.corr(y_sub, method="spearman")
+            if pd.isna(inferred_corr) or inferred_corr == 0:
+                direction_used = 1  # fallback
+            else:
+                direction_used = 1 if inferred_corr > 0 else -1
+
+        # --- compute worst-tail cutoff + bad rate ---
+        if direction_used == 1:
+            cutoff = float(x.quantile(1 - worst_pct))
+            tail_mask = x >= cutoff
+            tail_side = f"top_{int(worst_pct*100)}%"
+        else:
+            cutoff = float(x.quantile(worst_pct))
+            tail_mask = x <= cutoff
+            tail_side = f"bottom_{int(worst_pct*100)}%"
+
+        tail_n = int(tail_mask.sum())
+        if tail_n == 0:
+            continue
+
+        tail_bad_n = int(y_sub.loc[tail_mask].sum())
+        tail_bad_rate = tail_bad_n / tail_n
+
+        results.append({
+            "feature": col,                         # raw dataset column name
+            "cleaned_name": cleaned_name,          # cleaned name used for dictionary matching
+            "definition": definition,              # from data_dictionary['definition']
+            "direction_used": direction_used,      # +1 high_worse / -1 low_worse
+            "tail_side": tail_side,
+            "cutoff": cutoff,
+            "tail_n": tail_n,                      # volume
+            "tail_bad_n": tail_bad_n,              # bad volume
+            "tail_bad_rate": tail_bad_rate,        # bad rate in worst tail
+            "overall_bad_rate": overall_bad_rate,
+            "spearman_corr_if_inferred": inferred_corr
+        })
+
+    out = pd.DataFrame(results)
+    if out.empty:
+        return out
+
+    out = out.sort_values(["tail_bad_rate", "tail_n"], ascending=[False, False]).reset_index(drop=True)
+    out.insert(0, "rank", np.arange(1, len(out) + 1))
+    return out
+
+def rank_features_by_worst_tail_bad_bal(
+    data: pd.DataFrame,
+    bad_flag: str,
+    bad_bal: str,
+    num_list: list,
+    data_dictionary: pd.DataFrame = None,
+    worst_pct: float = 0.05,
+    min_non_missing: int = 200,
+    missing_sentinels: tuple = (-9999,),
+    direction_default: int = 0,
+):
+    """
+    Rank numerical features by BAD BALANCE captured in the worst X% tail.
+    """
+
+    df = data.copy()
+    total_bad = df.loc[df[bad_flag] == 1, bad_bal].sum()
+
+    # --- clean target ---
+    y = pd.to_numeric(df[bad_flag], errors="coerce")
+    df = df.loc[y.isin([0, 1])].copy()
+    df[bad_flag] = y.loc[df.index].astype(int)
+
+    # ---  balance ---
+
+    bal = pd.to_numeric(df[bad_bal], errors="coerce")
+    df[bad_bal] = bal
+
+    # --- prepare data dictionary ---
+    dd = None
+    if data_dictionary is not None:
+        dd = data_dictionary.copy()
+        dd.columns = [c.strip().lower() for c in dd.columns]
+
+        required = {"variable", "definition", "direction"}
+        if not required.issubset(set(dd.columns)):
+            raise ValueError(f"data_dictionary must include columns: {required}")
+
+        dd["variable"] = dd["variable"].astype(str).str.strip()
+        dd_lookup = dd.set_index("variable", drop=False)
+
+    # --- cleaning rule you defined ---
+    def clean_variable_name(target_variable: str) -> str:
+        s = str(target_variable)
+        cleaned = s.split("_")[-1] if "_" in s else s
+        cleaned = cleaned.rstrip(" -") if " -" in cleaned else cleaned
+        return cleaned
+
+    results = []
+
+    for col in num_list:
+        if col not in df.columns:
+            continue
+
+        x = pd.to_numeric(df[col], errors="coerce")
+
+        # treat sentinels as missing
+        for ms in missing_sentinels:
+            x = x.mask(x == ms)
+
+        mask = x.notna() & df[bad_bal].notna()
+        n_non_missing = int(mask.sum())
+        if n_non_missing < min_non_missing:
+            continue
+
+        x = x.loc[mask]
+        y_sub = df.loc[mask, bad_flag]
+        bal_sub = df.loc[mask, bad_bal]
+
+        cleaned_name = clean_variable_name(col)
+
+        # --- get direction & definition from dictionary ---
+        definition = None
+        direction = direction_default
+
+        if dd is not None and cleaned_name in dd_lookup.index:
+            row = dd_lookup.loc[cleaned_name]
+            definition = row.get("definition", None)
+            d = row.get("direction", np.nan)
+            if pd.notnull(d):
+                try:
+                    direction = int(float(d))
+                except Exception:
+                    direction = direction_default
+
+        # infer direction if missing
+        inferred_corr = np.nan
+        direction_used = direction
+
+        if direction_used == 0:
+            inferred_corr = x.corr(y_sub, method="spearman")
+            if pd.isna(inferred_corr) or inferred_corr == 0:
+                direction_used = 1
+            else:
+                direction_used = 1 if inferred_corr > 0 else -1
+
+        # --- determine worst tail ---
+        if direction_used == 1:
+            cutoff = float(x.quantile(1 - worst_pct))
+            tail_mask = x >= cutoff
+            tail_side = f"top_{int(worst_pct*100)}%"
+        else:
+            cutoff = float(x.quantile(worst_pct))
+            tail_mask = x <= cutoff
+            tail_side = f"bottom_{int(worst_pct*100)}%"
+
+        tail_n = int(tail_mask.sum())
+        if tail_n == 0:
+            continue
+
+        # --- bad / volume metrics ---
+        tail_bad_n = int(y_sub.loc[tail_mask].sum())
+        tail_bad_rate = tail_bad_n / tail_n
+
+        # --- BALANCE metrics  ---
+        tail_total_balance = bal_sub.loc[tail_mask].sum()
+        tail_bad_balance = bal_sub.loc[tail_mask & (y_sub == 1)].sum()
+
+        bad_balance_rate_in_tail = (
+            tail_bad_balance / tail_total_balance if tail_total_balance > 0 else np.nan
+        )
+
+        bad_balance_share_of_total = (
+            tail_bad_balance / total_bad if total_bad > 0 else np.nan
+        )
+
+        results.append({
+            "feature": col,
+            "cleaned_name": cleaned_name,
+            "definition": definition,
+            "direction_used": direction_used,
+            "tail_side": tail_side,
+            "cutoff": cutoff,
+
+            # volume & quality
+            "tail_n": tail_n,
+            "tail_bad_n": tail_bad_n,
+            "tail_bad_rate": tail_bad_rate,
+
+            # balance focus
+            "tail_total_balance": tail_total_balance,
+            "tail_bad_balance": tail_bad_balance,
+            "bad_balance_rate_in_tail": bad_balance_rate_in_tail,
+            "bad_balance_share_of_total": bad_balance_share_of_total,
+
+            # diagnostics
+            "spearman_corr_if_inferred": inferred_corr,
+        })
+
+    out = pd.DataFrame(results)
+    if out.empty:
+        return out
+
+    #  Rank by BAD BALANCE captured
+    out = out.sort_values(
+        ["tail_bad_balance", "bad_balance_share_of_total"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+
+    out.insert(0, "rank", np.arange(1, len(out) + 1))
+    return out
+
+
+
+def plot_top_worst_tail_bad_rates(
+    rank_table,
+    top_n=20,
+    bad_metric = "BR Bal" # "BR Vol" or "BR Bal"
+    use_cleaned_name=False,
+    show_pct=True
+):
+"""
+    Plot the top N features by worst-tail bad rate using Plotly.
+"""
+
+    if rank_table is None or rank_table.empty:
+        raise ValueError("rank_table is empty.")
+
+    label_col = "cleaned_name" if use_cleaned_name else "feature"
+
+    dfp = rank_table.head(top_n).copy()
+    dfp = dfp.sort_values("tail_bad_rate", ascending=True)
+
+    # Format display values
+    if show_pct:
+        dfp["bad_rate_display"] = (dfp["tail_bad_rate"] * 100).round(2).astype(str) + "%"
+        x_vals = dfp["tail_bad_rate"] * 100
+        x_label = "Bad rate in worst tail (%)"
+    else:
+        dfp["bad_rate_display"] = dfp["tail_bad_rate"].round(4).astype(str)
+        x_vals = dfp["tail_bad_rate"]
+        x_label = "Bad rate in worst tail"
+
+    fig = px.bar(
+        dfp,
+        x=x_vals,
+        y=dfp[label_col].astype(str),
+        orientation="h",
+        text="bad_rate_display",
+        hover_data={
+            "tail_n": True,              # volume
+            "tail_bad_n": True,          # bad volume
+            "cutoff": True,
+            "definition": True,
+            "direction_used": True,
+            "tail_side": True,
+        },
+        labels={
+            "x": x_label,
+            "y": "Feature"
+        },
+        title=f"Top {min(top_n, len(rank_table))} features by worst-tail {bad_metric}"
+        
+    )
+
+    # Make labels look nice
+    fig.update_traces(textposition="outside")
+
+    fig.update_layout(
+        yaxis=dict(categoryorder="total ascending"),
+        xaxis_tickformat=".2f" if show_pct else ".3f",
+        margin=dict(l=200, r=50, t=60, b=50),
+        height=max(500, 35 * len(dfp))
+    )
+
+    fig.show()
 
 # =============================================
 #       Correlation Analysis
@@ -591,7 +952,8 @@ def distribution_by_decile_logic(
 
     if data_dictionary is not None and "Variable" in data_dictionary.columns:
         if cleaned_var in set(data_dictionary["Variable"].astype(str).values):
-            row = data_dictionary.loc[data_dictionary["Variable"].astype(str) == cleaned_var].iloc[0]
+            row = data_dictionary.loc[data_dictionary["Variable"].astype(str) == cleaned_\
+            ar].iloc[0]
             min_value = float(row.get("Valid Min", -np.inf)) if pd.notnull(row.get("Valid Min", np.nan)) else -np.inf
             max_value = float(row.get("Valid Max", np.inf)) if pd.notnull(row.get("Valid Max", np.nan)) else np.inf
             direction = float(row.get("Direction", 0.0)) if pd.notnull(row.get("Direction", np.nan)) else 0.0
@@ -911,3 +1273,5 @@ def funnel_feature_selection(
     )
     fig.show()
     return fig
+
+
