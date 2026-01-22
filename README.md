@@ -5,7 +5,9 @@ An end-to-end Python framework for transforming raw data into **interpretable, o
 Designed for risk, fraud and compliance scenarios where **explainability, governance and performance trade-offs** are critical.
 
 ---
+<image src = "https://github.com/ramonple/NextGen_Rule_Engine/blob/5520e2638d6ea0112b110b4321afee52cbd6d604/Rule%20Engine%20icon.png">
 
+  
 ## ✨ Overview
 
 This project implements a modular pipeline that:
