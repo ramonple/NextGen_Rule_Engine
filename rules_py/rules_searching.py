@@ -679,3 +679,20 @@ def Rules_Optimisation_Search_Algorithm_3D(
         total_bal=total_bal,
         bad_bal=bad_bal,
     )
+
+
+import re, hashlib
+
+def make_rule(expr: str):
+    norm = re.sub(r"\s+", " ", expr.strip())
+    rule_id = hashlib.md5(norm.encode()).hexdigest()[:8]   # stable short id
+    rule_name = re.sub(r"[^a-zA-Z0-9]+", "_", norm).strip("_").lower()
+    rule_name = (rule_name[:40] + "_" + rule_id)  # readable + unique
+    return {"rule_name": rule_name, "rule_logic": norm}
+
+rules = [
+    make_rule("data['a'] > 5"),
+    make_rule("(data['b'] <= 10) & (data['c'].isna())"),
+]
+
+rules
