@@ -313,76 +313,176 @@ def rule_to_string(rule, fallback: str = "<unnamed rule>") -> str:
 
 
 
+from __future__ import annotations
+
+from typing import Dict, List, Union
+import numpy as np
+import pandas as pd
+
+
 def build_rule_impact_table_from_masks(
     data: pd.DataFrame,
     rules: Union[List[pd.Series], Dict[str, pd.Series]],
     bad_flag: str,
     total_bal: str,
     bad_bal: str,
+    baseline_name: str = "BASELINE (no rule)",
 ) -> pd.DataFrame:
-    # ---- baseline ----
-    base_vol = len(data)
+    """
+    Build a rule impact table for multiple rules (evaluated independently vs the same baseline),
+    with a top row showing the baseline (no rule implemented).
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Full dataset (baseline population).
+    rules : list[pd.Series] OR dict[str, pd.Series]
+        Boolean masks aligned to data.index.
+        - If dict: keys are used as rule identifiers.
+        - If list: rule.name is used if present, else fallback to 'rule_{i}'.
+    bad_flag : str
+        Column name indicating bad flag (bad if > 0).
+    total_bal : str
+        Column name for total balance/exposure.
+    bad_bal : str
+        Column name for bad balance/exposure.
+    baseline_name : str
+        Label to display for baseline row.
+
+    Returns
+    -------
+    pd.DataFrame
+        Impact table: baseline row + one row per rule.
+    """
+    # ---- column checks ----
+    for c in (bad_flag, total_bal, bad_bal):
+        if c not in data.columns:
+            raise KeyError(f"data missing required column: {c}")
+
+    # ---- baseline stats ----
+    base_vol = int(len(data))
     base_bad_vol = int((data[bad_flag] > 0).sum())
     base_bal = float(data[total_bal].sum())
     base_bad_bal = float(data[bad_bal].sum())
     base_good_vol = base_vol - base_bad_vol
 
-    # normalize input
+    base_br_vol = 0.0 if base_vol == 0 else round(base_bad_vol / base_vol * 100, 2)
+    base_br_bal = 0.0 if base_bal == 0 else round(base_bad_bal / base_bal * 100, 2)
+
+    # ---- baseline row (top row) ----
+    rows = [
+        {
+            "rule_logic": baseline_name,
+            "total_volume": base_vol,
+            "total_reduced": 0,
+            "total_reduced_pct": 0.0,
+            "total_bad_volume": base_bad_vol,
+            "bad_volume_reduced": 0,
+            "bad_volume_reduced_pct": 0.0,
+            "total_balance": base_bal,
+            "balance_reduced": 0.0,
+            "balance_reduced_pct": 0.0,
+            "total_bad_balance": base_bad_bal,
+            "bad_balance_reduced": 0.0,
+            "bad_balance_reduced_pct": 0.0,
+            # For baseline, "marginal" equals baseline
+            "marginal_bad_vol_rate_pct": base_br_vol,
+            "marginal_bad_bal_rate_pct": base_br_bal,
+            # Neutral reference
+            "G_to_B": 1.0,
+        }
+    ]
+
+    # ---- normalize rule input ----
     if isinstance(rules, dict):
         items = list(rules.items())  # (name, rule)
     else:
         items = [(None, r) for r in rules]
 
-    rows = []
-
     for i, (name, rule) in enumerate(items, start=1):
         mask = pd.Series(rule, index=data.index).astype(bool)
         removed = data.loc[mask]
 
-        # ---- naming priority: dict key > rule.name > fallback ----
+        # naming priority: dict key > rule.name > fallback
         rule_logic = (
             name
             or (rule.name if isinstance(rule, pd.Series) else None)
             or f"rule_{i}"
         )
 
-        # ---- marginal removed stats ----
+        # ---- marginal (removed) stats ----
         rem_vol = int(mask.sum())
         rem_bad_vol = int((removed[bad_flag] > 0).sum())
         rem_good_vol = rem_vol - rem_bad_vol
+
         rem_bal = float(removed[total_bal].sum())
         rem_bad_bal = float(removed[bad_bal].sum())
 
-        # ---- new baseline after removing ----
+        marginal_br_vol = 0.0 if rem_vol == 0 else round(rem_bad_vol / rem_vol * 100, 2)
+        marginal_br_bal = 0.0 if rem_bal == 0 else round(rem_bad_bal / rem_bal * 100, 2)
+
+        # ---- new baseline after removing this rule ----
         new_vol = base_vol - rem_vol
         new_bad_vol = base_bad_vol - rem_bad_vol
         new_bal = base_bal - rem_bal
         new_bad_bal = base_bad_bal - rem_bad_bal
 
-        marginal_br_vol = 0.0 if rem_vol == 0 else round(rem_bad_vol / rem_vol * 100, 2)
-        marginal_br_bal = 0.0 if rem_bal == 0 else round(rem_bad_bal / rem_bal * 100, 2)
+        # ---- reductions (absolute + %) ----
+        vol_reduced_pct = 0.0 if base_vol == 0 else round(rem_vol / base_vol * 100, 2)
+        bad_vol_reduced_pct = 0.0 if base_bad_vol == 0 else round(rem_bad_vol / base_bad_vol * 100, 2)
+
+        bal_reduced_pct = 0.0 if base_bal == 0 else round(rem_bal / base_bal * 100, 2)
+        bad_bal_reduced_pct = 0.0 if base_bad_bal == 0 else round(rem_bad_bal / base_bad_bal * 100, 2)
 
         # ---- G:B ratio ----
         bad_removed_share = rem_bad_vol / base_bad_vol if base_bad_vol > 0 else np.nan
         good_removed_share = rem_good_vol / base_good_vol if base_good_vol > 0 else np.nan
+
         if good_removed_share == 0:
-            gb_ratio = np.inf if bad_removed_share > 0 else np.nan
+            gb_ratio = np.inf if (bad_removed_share is not None and bad_removed_share > 0) else np.nan
         else:
-            gb_ratio = round(bad_removed_share / good_removed_share, 4)
+            gb_ratio = float(np.round(bad_removed_share / good_removed_share, 4)) if np.isfinite(good_removed_share) else np.nan
 
-        rows.append({
-            "rule_logic": rule_logic,
-            "total_volume": new_vol,
-            "total_reduced": rem_vol,
-            "total_bad_volume": new_bad_vol,
-            "bad_volume_reduced": rem_bad_vol,
-            "total_balance": new_bal,
-            "balance_reduced_pct": round(rem_bal / base_bal * 100, 2) if base_bal > 0 else 0.0,
-            "total_bad_balance": new_bad_bal,
-            "bad_balance_reduced_pct": round(rem_bad_bal / base_bad_bal * 100, 2) if base_bad_bal > 0 else 0.0,
-            "marginal_bad_vol_rate_pct": marginal_br_vol,
-            "marginal_bad_bal_rate_pct": marginal_br_bal,
-            "G_to_B": gb_ratio,
-        })
+        rows.append(
+            {
+                "rule_logic": rule_logic,
 
-    return pd.DataFrame(rows)
+                # new baseline totals
+                "total_volume": new_vol,
+                "total_bad_volume": new_bad_vol,
+                "total_balance": new_bal,
+                "total_bad_balance": new_bad_bal,
+
+                # reductions
+                "total_reduced": rem_vol,
+                "total_reduced_pct": vol_reduced_pct,
+                "bad_volume_reduced": rem_bad_vol,
+                "bad_volume_reduced_pct": bad_vol_reduced_pct,
+                "balance_reduced": rem_bal,
+                "balance_reduced_pct": bal_reduced_pct,
+                "bad_balance_reduced": rem_bad_bal,
+                "bad_balance_reduced_pct": bad_bal_reduced_pct,
+
+                # marginal rates
+                "marginal_bad_vol_rate_pct": marginal_br_vol,
+                "marginal_bad_bal_rate_pct": marginal_br_bal,
+
+                # GB
+                "G_to_B": gb_ratio,
+            }
+        )
+
+    # Order columns nicely
+    df = pd.DataFrame(rows)
+
+    preferred_order = [
+        "rule_logic",
+        "total_volume", "total_reduced", "total_reduced_pct",
+        "total_bad_volume", "bad_volume_reduced", "bad_volume_reduced_pct",
+        "total_balance", "balance_reduced", "balance_reduced_pct",
+        "total_bad_balance", "bad_balance_reduced", "bad_balance_reduced_pct",
+        "marginal_bad_vol_rate_pct", "marginal_bad_bal_rate_pct",
+        "G_to_B",
+    ]
+    cols = [c for c in preferred_order if c in df.columns] + [c for c in df.columns if c not in preferred_order]
+    return df[cols]
