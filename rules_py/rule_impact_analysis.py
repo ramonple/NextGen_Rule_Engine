@@ -293,67 +293,67 @@ def build_new_baseline_table_from_rule_list(
 #=======================================
 #         Summary table creation 
 #=======================================
-def _rule_to_string(rule: pd.Series) -> str:
+def rule_to_string(rule, fallback: str = "<unnamed rule>") -> str:
     """
-    Best-effort conversion of a boolean mask into a readable expression.
+    Return a human-readable rule identifier.
+
+    Priority:
+    1. rule.name (if set)
+    2. fallback
     """
-    # 1) If user named the Series explicitly
-    if isinstance(rule, pd.Series) and rule.name:
-        return str(rule.name)
+    try:
+        name = getattr(rule, "name", None)
+        if isinstance(name, str) and name.strip():
+            return name
+    except Exception:
+        pass
 
-    # 2) Pandas sometimes keeps expression text in repr
-    s = repr(rule)
-    if "dtype=bool" in s:
-        s = s.split("dtype=bool")[0].strip()
+    return fallback
 
-    # Trim common noise
-    s = s.replace("Name:", "").strip()
 
-    # Fallback
-    return s if len(s) < 120 else "<boolean rule>"
 
 
 def build_rule_impact_table_from_masks(
     data: pd.DataFrame,
-    rules: List[pd.Series],
-    *,
+    rules: Union[List[pd.Series], Dict[str, pd.Series]],
     bad_flag: str,
     total_bal: str,
     bad_bal: str,
 ) -> pd.DataFrame:
-
-    """
-    rule1 = (data["x"] > 5)
-    rule2 = (data["y"] < 5) & (data["z"] > 5)
-    rule3 = (data["z"] < 4) | (data["w"] > 9)
-
-    rules = [rule1, rule2, rule3]
-
-    where each rule is a boolean mask aligned to data.index
-
-    """
+    # ---- baseline ----
     base_vol = len(data)
     base_bad_vol = int((data[bad_flag] > 0).sum())
     base_bal = float(data[total_bal].sum())
     base_bad_bal = float(data[bad_bal].sum())
     base_good_vol = base_vol - base_bad_vol
 
+    # normalize input
+    if isinstance(rules, dict):
+        items = list(rules.items())  # (name, rule)
+    else:
+        items = [(None, r) for r in rules]
+
     rows = []
 
-    for rule in rules:
+    for i, (name, rule) in enumerate(items, start=1):
         mask = pd.Series(rule, index=data.index).astype(bool)
         removed = data.loc[mask]
 
-        # auto rule name
-        rule_logic = _rule_to_string(rule)
+        # ---- naming priority: dict key > rule.name > fallback ----
+        rule_logic = (
+            name
+            or (rule.name if isinstance(rule, pd.Series) else None)
+            or f"rule_{i}"
+        )
 
+        # ---- marginal removed stats ----
         rem_vol = int(mask.sum())
         rem_bad_vol = int((removed[bad_flag] > 0).sum())
         rem_good_vol = rem_vol - rem_bad_vol
-
         rem_bal = float(removed[total_bal].sum())
         rem_bad_bal = float(removed[bad_bal].sum())
 
+        # ---- new baseline after removing ----
         new_vol = base_vol - rem_vol
         new_bad_vol = base_bad_vol - rem_bad_vol
         new_bal = base_bal - rem_bal
@@ -362,12 +362,13 @@ def build_rule_impact_table_from_masks(
         marginal_br_vol = 0.0 if rem_vol == 0 else round(rem_bad_vol / rem_vol * 100, 2)
         marginal_br_bal = 0.0 if rem_bal == 0 else round(rem_bad_bal / rem_bal * 100, 2)
 
+        # ---- G:B ratio ----
         bad_removed_share = rem_bad_vol / base_bad_vol if base_bad_vol > 0 else np.nan
         good_removed_share = rem_good_vol / base_good_vol if base_good_vol > 0 else np.nan
-        gb_ratio = (
-            round(bad_removed_share / good_removed_share, 4)
-            if good_removed_share > 0 else np.inf
-        )
+        if good_removed_share == 0:
+            gb_ratio = np.inf if bad_removed_share > 0 else np.nan
+        else:
+            gb_ratio = round(bad_removed_share / good_removed_share, 4)
 
         rows.append({
             "rule_logic": rule_logic,
@@ -376,15 +377,12 @@ def build_rule_impact_table_from_masks(
             "total_bad_volume": new_bad_vol,
             "bad_volume_reduced": rem_bad_vol,
             "total_balance": new_bal,
-            "balance_reduced_pct": round(rem_bal / base_bal * 100, 2) if base_bal > 0 else 0,
+            "balance_reduced_pct": round(rem_bal / base_bal * 100, 2) if base_bal > 0 else 0.0,
             "total_bad_balance": new_bad_bal,
-            "bad_balance_reduced_pct": round(rem_bad_bal / base_bad_bal * 100, 2) if base_bad_bal > 0 else 0,
+            "bad_balance_reduced_pct": round(rem_bad_bal / base_bad_bal * 100, 2) if base_bad_bal > 0 else 0.0,
             "marginal_bad_vol_rate_pct": marginal_br_vol,
             "marginal_bad_bal_rate_pct": marginal_br_bal,
             "G_to_B": gb_ratio,
         })
 
     return pd.DataFrame(rows)
-
-
-
