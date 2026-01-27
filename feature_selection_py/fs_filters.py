@@ -287,9 +287,13 @@ def rank_features_by_worst_tail_bad_vol(
     out.insert(0, "rank", np.arange(1, len(out) + 1))
     return out
 
+
+
+
 def rank_features_by_worst_tail_bad_bal(
     data: pd.DataFrame,
     bad_flag: str,
+    total_bal: str,          
     bad_bal: str,
     num_list: list,
     data_dictionary: pd.DataFrame = None,
@@ -300,23 +304,29 @@ def rank_features_by_worst_tail_bad_bal(
 ):
     """
     Rank numerical features by BAD BALANCE captured in the worst X% tail.
+
+    Uses:
+      - total_bal: total exposure/balance
+      - bad_bal: bad exposure/balance
     """
 
     df = data.copy()
-    total_bad = df.loc[df[bad_flag] == 1, bad_bal].sum()
 
     # --- clean target ---
     y = pd.to_numeric(df[bad_flag], errors="coerce")
     df = df.loc[y.isin([0, 1])].copy()
     df[bad_flag] = y.loc[df.index].astype(int)
 
-    # ---  balance ---
+    # --- balances ---
+    df[total_bal] = pd.to_numeric(df[total_bal], errors="coerce")
+    df[bad_bal] = pd.to_numeric(df[bad_bal], errors="coerce")
 
-    bal = pd.to_numeric(df[bad_bal], errors="coerce")
-    df[bad_bal] = bal
+    # total bad balance (baseline reference)
+    total_bad_balance_all = df[bad_bal].sum(skipna=True)
 
     # --- prepare data dictionary ---
     dd = None
+    dd_lookup = None
     if data_dictionary is not None:
         dd = data_dictionary.copy()
         dd.columns = [c.strip().lower() for c in dd.columns]
@@ -328,7 +338,6 @@ def rank_features_by_worst_tail_bad_bal(
         dd["variable"] = dd["variable"].astype(str).str.strip()
         dd_lookup = dd.set_index("variable", drop=False)
 
-    # --- cleaning rule you defined ---
     def clean_variable_name(target_variable: str) -> str:
         s = str(target_variable)
         cleaned = s.split("_")[-1] if "_" in s else s
@@ -347,22 +356,24 @@ def rank_features_by_worst_tail_bad_bal(
         for ms in missing_sentinels:
             x = x.mask(x == ms)
 
-        mask = x.notna() & df[bad_bal].notna()
+        # need x + balances
+        mask = x.notna() & df[total_bal].notna() & df[bad_bal].notna()
         n_non_missing = int(mask.sum())
         if n_non_missing < min_non_missing:
             continue
 
         x = x.loc[mask]
         y_sub = df.loc[mask, bad_flag]
-        bal_sub = df.loc[mask, bad_bal]
+        total_bal_sub = df.loc[mask, total_bal]
+        bad_bal_sub = df.loc[mask, bad_bal]
 
         cleaned_name = clean_variable_name(col)
 
-        # --- get direction & definition from dictionary ---
+        # --- dictionary info ---
         definition = None
         direction = direction_default
 
-        if dd is not None and cleaned_name in dd_lookup.index:
+        if dd_lookup is not None and cleaned_name in dd_lookup.index:
             row = dd_lookup.loc[cleaned_name]
             definition = row.get("definition", None)
             d = row.get("direction", np.nan)
@@ -397,20 +408,20 @@ def rank_features_by_worst_tail_bad_bal(
         if tail_n == 0:
             continue
 
-        # --- bad / volume metrics ---
+        # --- volume metrics ---
         tail_bad_n = int(y_sub.loc[tail_mask].sum())
         tail_bad_rate = tail_bad_n / tail_n
 
-        # --- BALANCE metrics  ---
-        tail_total_balance = bal_sub.loc[tail_mask].sum()
-        tail_bad_balance = bal_sub.loc[tail_mask & (y_sub == 1)].sum()
+        # --- balance metrics ---
+        tail_total_balance = float(total_bal_sub.loc[tail_mask].sum())
+        tail_bad_balance = float(bad_bal_sub.loc[tail_mask].sum())
 
         bad_balance_rate_in_tail = (
             tail_bad_balance / tail_total_balance if tail_total_balance > 0 else np.nan
         )
 
         bad_balance_share_of_total = (
-            tail_bad_balance / total_bad if total_bad > 0 else np.nan
+            tail_bad_balance / total_bad_balance_all if total_bad_balance_all > 0 else np.nan
         )
 
         results.append({
@@ -421,18 +432,15 @@ def rank_features_by_worst_tail_bad_bal(
             "tail_side": tail_side,
             "cutoff": cutoff,
 
-            # volume & quality
             "tail_n": tail_n,
             "tail_bad_n": tail_bad_n,
             "tail_bad_rate": tail_bad_rate,
 
-            # balance focus
             "tail_total_balance": tail_total_balance,
             "tail_bad_balance": tail_bad_balance,
             "bad_balance_rate_in_tail": bad_balance_rate_in_tail,
             "bad_balance_share_of_total": bad_balance_share_of_total,
 
-            # diagnostics
             "spearman_corr_if_inferred": inferred_corr,
         })
 
@@ -440,7 +448,7 @@ def rank_features_by_worst_tail_bad_bal(
     if out.empty:
         return out
 
-    #  Rank by BAD BALANCE captured
+    # Rank by BAD BALANCE captured (and share)
     out = out.sort_values(
         ["tail_bad_balance", "bad_balance_share_of_total"],
         ascending=[False, False]
